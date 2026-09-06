@@ -1,0 +1,5 @@
+Pillow>=10,<13
+numpy>=1.26,<3
+opencv-python>=4.8,<6
+rapidocr-onnxruntime==1.4.4
+pywin32>=306; sys_platform == 'win32'
