@@ -192,6 +192,18 @@ def visible_candidates(image):
     return candidates
 
 
+def material_sort_direction(words):
+    """仅识别解锁材料列表顶部的排序按钮，不匹配背包或其他页面文字。"""
+    directions = set()
+    for box, text, score in words:
+        x, y = np.mean(box, axis=0)
+        if score >= .85 and 400 <= x <= 545 and 140 <= y <= 195 and text in ("升序", "降序"):
+            directions.add(text)
+    if len(directions) > 1:
+        raise Stop("解锁材料排序按钮识别冲突，不点击。")
+    return next(iter(directions), None)
+
+
 def unlock_progress(words):
     values = []
     for box, text, score in words:
@@ -515,6 +527,27 @@ class Assistant:
             rejected.clear()
         return False
 
+    def ensure_materials_ascending(self, image, words):
+        """升序不点；降序只切换一次，并等待看到升序后才允许选材。"""
+        self.require(words, "特别装备上限解锁", (250, 15, 1150, 115))
+        direction = material_sort_direction(words)
+        if direction == "升序":
+            print("解锁材料已是升序，跳过排序切换。", flush=True)
+            return image, words
+        if direction != "降序":
+            raise Stop("未识别到解锁材料排序按钮的升序/降序状态，不盲点。")
+        print("解锁材料为降序，点击一次切换升序，优先查找 1 点数材料。", flush=True)
+        self.win.click(470, 168)
+        deadline = time.monotonic()+10
+        while time.monotonic() < deadline:
+            image, words = self.snapshot("materials-sort-ascending")
+            self.require(words, "特别装备上限解锁", (250, 15, 1150, 115))
+            if material_sort_direction(words) == "升序":
+                print("已确认解锁材料排序为升序，重新识别当前材料列表。", flush=True)
+                return image, words
+            time.sleep(.4)
+        raise Stop("点击排序后未确认变为升序，不重复点击，也不继续选材。")
+
     def select_materials(self):
         """仅选择，不提交。每次选择后核对 Pt 恰好增加 1，满额即停。"""
         image, words = self.snapshot("materials-start")
@@ -522,6 +555,9 @@ class Assistant:
         current, needed = unlock_progress(words)
         if current:
             raise Stop("解锁页已有材料选择，无法证明其来源，请先清空后重启。")
+        image, words = self.ensure_materials_ascending(image, words)
+        if unlock_progress(words) != (current, needed):
+            raise Stop("排序后材料 Pt 或需求发生变化，停止，不继续选材。")
         chosen = set()
         previous = None
         still = 0

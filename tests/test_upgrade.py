@@ -6,7 +6,7 @@ import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, call
 
 import numpy as np
 from PIL import Image
@@ -15,7 +15,7 @@ from upgrade_equipment import (
     BASE, STAR_CENTERS, Assistant, Stop, classify_stars,
     scrollbar_bottom, visible_candidates, material_candidates, unlock_progress, validate_pt_confirmation,
     has_pink_diamond_outline, MaterialsUnavailable, Stars, artwork,
-    has_solid_gray_fill, mirror_log, main,
+    has_solid_gray_fill, mirror_log, main, material_sort_direction,
 )
 
 FIXTURES = Path(__file__).parent / 'fixtures'
@@ -43,6 +43,8 @@ class RecognitionTests(unittest.TestCase):
         bot = self.shortage_bot()
         image = frame('materials-exhausted.png', 50, 200)
         words = json.loads((FIXTURES / 'materials-exhausted-ocr.json').read_text(encoding='utf-8'))
+        # 材料耗尽测试从已升序的状态开始，不再触发排序切换。
+        words = [(box, '升序' if text == '降序' else text, score) for box, text, score in words]
         bot.snapshot = MagicMock(return_value=(image, words))
         with self.assertRaises(MaterialsUnavailable) as caught:
             bot.select_materials()
@@ -251,6 +253,101 @@ class RecognitionTests(unittest.TestCase):
         words = [([[10, 10], [100, 10], [100, 30], [10, 30]], '特别装备强化', .99)]
         self.assertTrue(Assistant.has(words, '特别装备强化', (0, 0, 200, 100)))
         self.assertFalse(Assistant.has(words, '特别装备强化', (500, 500, 1000, 700)))
+
+
+class MaterialSortTests(unittest.TestCase):
+    @staticmethod
+    def words(direction='降序', progress='0/2'):
+        return [
+            ([[580, 40], [850, 40], [850, 80], [580, 80]], '特别装备上限解锁', .99),
+            ([[413, 154], [466, 154], [466, 184], [413, 184]], direction, .99),
+            ([[1200, 310], [1248, 310], [1248, 340], [1200, 340]], progress, .99),
+        ]
+
+    def bot(self):
+        bot = Assistant.__new__(Assistant)
+        bot.win = MagicMock()
+        bot.snapshot = MagicMock()
+        bot.args = SimpleNamespace(max_scrolls=8)
+        return bot
+
+    def test_descending_clicked_once_and_fresh_frame_returned(self):
+        bot = self.bot()
+        before, after = object(), object()
+        ascending = self.words('升序')
+        bot.snapshot.return_value = (after, ascending)
+        self.assertEqual(bot.ensure_materials_ascending(before, self.words()), (after, ascending))
+        bot.win.click.assert_called_once_with(470, 168)
+
+    def test_already_ascending_never_toggled(self):
+        bot = self.bot()
+        image, words = object(), self.words('升序')
+        self.assertEqual(bot.ensure_materials_ascending(image, words), (image, words))
+        bot.win.click.assert_not_called()
+        bot.snapshot.assert_not_called()
+
+    def test_other_sort_buttons_outside_region_are_ignored(self):
+        words = self.words('升序')
+        words.append(([[510, 108], [570, 108], [570, 136], [510, 136]], '降序', .99))
+        self.assertEqual(material_sort_direction(words), '升序')
+        self.assertIsNone(material_sort_direction(words[-1:]))
+
+    def test_unknown_sort_direction_stops_without_click(self):
+        bot = self.bot()
+        with self.assertRaisesRegex(Stop, '不盲点'):
+            bot.ensure_materials_ascending(object(), self.words('排序'))
+        bot.win.click.assert_not_called()
+
+    def test_wrong_page_never_clicked(self):
+        bot = self.bot()
+        with self.assertRaisesRegex(Stop, '预期页面文字'):
+            bot.ensure_materials_ascending(object(), self.words()[1:])
+        bot.win.click.assert_not_called()
+
+    def test_conflicting_directions_never_clicked(self):
+        bot = self.bot()
+        with self.assertRaisesRegex(Stop, '冲突'):
+            bot.ensure_materials_ascending(object(), self.words()+self.words('升序'))
+        bot.win.click.assert_not_called()
+
+    def test_unchanged_button_stops_without_second_toggle(self):
+        bot = self.bot()
+        bot.snapshot.return_value = (object(), self.words())
+        with patch('upgrade_equipment.time.monotonic', side_effect=[0, 0, 11]), \
+             patch('upgrade_equipment.time.sleep'):
+            with self.assertRaisesRegex(Stop, '未确认变为升序'):
+                bot.ensure_materials_ascending(object(), self.words())
+        bot.win.click.assert_called_once_with(470, 168)
+
+    def test_selects_from_sorted_frame_without_scrolling(self):
+        bot = self.bot()
+        before, after, selected = object(), object(), object()
+        bot.snapshot.side_effect = [
+            (before, self.words(progress='0/1')),
+            (after, self.words('升序', '0/1')),
+            (selected, self.words('升序', '1/1')),
+        ]
+        with patch('upgrade_equipment.material_candidates', return_value=[(143, 274)]) as candidates:
+            self.assertEqual(bot.select_materials(), 1)
+        self.assertIs(candidates.call_args.args[0], after)
+        self.assertEqual(bot.win.click.call_args_list, [call(470, 168), call(143, 274)])
+        bot.win.scroll_down.assert_not_called()
+
+    def test_existing_selection_stops_before_sort(self):
+        bot = self.bot()
+        bot.snapshot.return_value = (object(), self.words(progress='1/2'))
+        with self.assertRaisesRegex(Stop, '已有材料选择'):
+            bot.select_materials()
+        bot.win.click.assert_not_called()
+
+    def test_progress_changed_during_sort_stops_before_selection(self):
+        bot = self.bot()
+        bot.snapshot.side_effect = [
+            (object(), self.words()), (object(), self.words('升序', '1/2')),
+        ]
+        with self.assertRaisesRegex(Stop, '排序后材料 Pt'):
+            bot.select_materials()
+        bot.win.click.assert_called_once_with(470, 168)
 
 
 class LoggingTests(unittest.TestCase):
