@@ -39,7 +39,7 @@ class RecognitionTests(unittest.TestCase):
         bot.require = MagicMock()
         return bot
 
-    def test_real_material_bottom_raises_recoverable_shortage(self):
+    def test_ascending_without_safe_materials_skips_without_scrolling(self):
         bot = self.shortage_bot()
         image = frame('materials-exhausted.png', 50, 200)
         words = json.loads((FIXTURES / 'materials-exhausted-ocr.json').read_text(encoding='utf-8'))
@@ -49,8 +49,9 @@ class RecognitionTests(unittest.TestCase):
         with self.assertRaises(MaterialsUnavailable) as caught:
             bot.select_materials()
         self.assertEqual((caught.exception.selected, caught.exception.needed), (0, 2))
-        self.assertEqual(bot.win.scroll_down.call_count, 2)
+        bot.win.scroll_down.assert_not_called()
         bot.win.click.assert_not_called()
+        bot.snapshot.assert_called_once_with('materials-start')
 
     def test_shortage_cancels_and_never_submits(self):
         bot = self.shortage_bot()
@@ -73,14 +74,14 @@ class RecognitionTests(unittest.TestCase):
         bot.current_name = '另一种耳饰'
         self.assertFalse(bot.known_material_shortage(image, stars))
 
-    def test_material_scroll_failure_still_stops(self):
+    def test_material_recognition_failure_still_stops(self):
         bot = self.shortage_bot()
         image = frame('detail-sage-empty.png')
         bot.detail = MagicMock(return_value=(image, classify_stars(image)))
         bot.open = MagicMock()
-        bot.select_materials = MagicMock(side_effect=Stop('滚动失效，未确认到底'))
+        bot.select_materials = MagicMock(side_effect=Stop('排序状态不明'))
         bot.skip_material_shortage = MagicMock()
-        with self.assertRaisesRegex(Stop, '滚动失效'):
+        with self.assertRaisesRegex(Stop, '排序状态不明'):
             bot.process()
         bot.skip_material_shortage.assert_not_called()
 
@@ -331,6 +332,45 @@ class MaterialSortTests(unittest.TestCase):
             self.assertEqual(bot.select_materials(), 1)
         self.assertIs(candidates.call_args.args[0], after)
         self.assertEqual(bot.win.click.call_args_list, [call(470, 168), call(143, 274)])
+        bot.win.scroll_down.assert_not_called()
+
+    def test_ascending_empty_page_skips_without_checking_bottom(self):
+        bot = self.bot()
+        bot.snapshot.return_value = (object(), self.words('升序'))
+        with patch('upgrade_equipment.material_candidates', return_value=[]):
+            with self.assertRaises(MaterialsUnavailable) as caught:
+                bot.select_materials()
+        self.assertEqual((caught.exception.selected, caught.exception.needed), (0, 2))
+        self.assertIn('无需向下滚动', str(caught.exception))
+        bot.snapshot.assert_called_once_with('materials-start')
+        bot.win.click.assert_not_called()
+        bot.win.scroll_down.assert_not_called()
+
+    def test_partial_selection_then_no_more_materials_skips_without_scrolling(self):
+        bot = self.bot()
+        bot.snapshot.side_effect = [
+            (object(), self.words('升序', '0/2')),
+            (object(), self.words('升序', '1/2')),
+        ]
+        # 即使图像检测重复返回刚选过的坐标，也不能再点一次或向下滚动。
+        with patch('upgrade_equipment.material_candidates', return_value=[(143, 274)]):
+            with self.assertRaises(MaterialsUnavailable) as caught:
+                bot.select_materials()
+        self.assertEqual((caught.exception.selected, caught.exception.needed), (1, 2))
+        bot.win.click.assert_called_once_with(143, 274)
+        bot.win.scroll_down.assert_not_called()
+
+    def test_sort_changes_after_selection_is_not_treated_as_shortage(self):
+        bot = self.bot()
+        bot.snapshot.side_effect = [
+            (object(), self.words('升序', '0/2')),
+            (object(), self.words('降序', '1/2')),
+        ]
+        with patch('upgrade_equipment.material_candidates', return_value=[(143, 274)]):
+            with self.assertRaisesRegex(Stop, '未能确认保持升序') as caught:
+                bot.select_materials()
+        self.assertNotIsInstance(caught.exception, MaterialsUnavailable)
+        bot.win.click.assert_called_once_with(143, 274)
         bot.win.scroll_down.assert_not_called()
 
     def test_existing_selection_stops_before_sort(self):

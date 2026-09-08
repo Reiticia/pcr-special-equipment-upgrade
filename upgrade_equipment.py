@@ -68,10 +68,11 @@ class Stop(RuntimeError):
 
 
 class MaterialsUnavailable(Stop):
-    """仅在材料列表已确认到底且不足时抛出，可安全取消后继续下一件。"""
+    """已确认升序且当前页无更多安全材料，可取消选材后跳过，不再滚动。"""
     def __init__(self, selected, needed):
         self.selected, self.needed = selected, needed
-        super().__init__(f"材料列表已到底，仅找到 {selected}/{needed} 点安全材料")
+        super().__init__(f"材料列表已确认升序，当前页无更多可用的 1 点数材料，"
+                         f"仅找到 {selected}/{needed} 点安全材料，无需向下滚动")
 
 
 @dataclass(frozen=True)
@@ -549,7 +550,7 @@ class Assistant:
         raise Stop("点击排序后未确认变为升序，不重复点击，也不继续选材。")
 
     def select_materials(self):
-        """仅选择，不提交。每次选择后核对 Pt 恰好增加 1，满额即停。"""
+        """仅在已确认升序的当前页选材，不滚动；每次核对 +1 Pt，满额即停。"""
         image, words = self.snapshot("materials-start")
         self.require(words, "特别装备上限解锁", (250, 15, 1150, 115))
         current, needed = unlock_progress(words)
@@ -559,43 +560,26 @@ class Assistant:
         if unlock_progress(words) != (current, needed):
             raise Stop("排序后材料 Pt 或需求发生变化，停止，不继续选材。")
         chosen = set()
-        previous = None
-        still = 0
-        for page in range(self.args.max_scrolls+1):
+        while current < needed:
             self.require(words, "特别装备上限解锁", (250, 15, 1150, 115))
+            if material_sort_direction(words) != "升序":
+                raise Stop("选材时未能确认保持升序，不按缺料跳过，也不继续点击。")
             candidates = [p for p in material_candidates(image, words) if p not in chosen]
-            if candidates:
-                x, y = candidates[0]
-                print(f"自动选择基础未强化同名材料 ({x},{y})；当前 Pt={current}/{needed}。", flush=True)
-                before = current
-                self.win.click(x, y)
-                image, words = self.snapshot("material-selected")
-                self.require(words, "特别装备上限解锁", (250, 15, 1150, 115))
-                current, denominator = unlock_progress(words)
-                if denominator != needed or current != before+1:
-                    raise Stop("选择后 Pt 未恰好增加 1，停止；请检查已选材料（尚未提交消耗）。")
-                chosen.add((x, y))
-                if current == needed:
-                    print(f"已自动选好 {current} 点基础材料，满足本次解锁；尚未提交消耗。", flush=True)
-                    return current
-                continue
-            panel = image[205:635, 75:677].astype(float)
-            delta = float(np.mean(np.abs(panel-previous))) if previous is not None else 255
-            still = still+1 if delta < 1 else 0
-            bar = image[210:635, 688:700].astype(float)
-            ys, _ = np.where((bar[:, :, 2] > 150) & (bar[:, :, 2]-bar[:, :, 0] > 45))
-            if still >= 2 and len(ys) and ys.max()+210 >= 624:
+            if not candidates:
+                # 升序下后续材料点数只会更高，无需滚到列表底部才判定缺料。
                 raise MaterialsUnavailable(current, needed)
-            if still >= 4:
-                raise Stop("材料列表滚动未变化且无法确认到底；停止，不提交已选材料。")
-            if page == self.args.max_scrolls:
-                raise Stop("材料搜索达到安全上限；停止，不提交。")
-            print("没有新的可识别基础材料，向下滚动查找。", flush=True)
-            previous = panel
-            self.win.scroll_down()
-            chosen.clear()
-            image, words = self.snapshot("materials-scroll")
-        raise Stop("材料搜索未完成，不提交。")
+            x, y = candidates[0]
+            print(f"自动选择基础未强化同名材料 ({x},{y})；当前 Pt={current}/{needed}。", flush=True)
+            before = current
+            self.win.click(x, y)
+            image, words = self.snapshot("material-selected")
+            self.require(words, "特别装备上限解锁", (250, 15, 1150, 115))
+            current, denominator = unlock_progress(words)
+            if denominator != needed or current != before+1:
+                raise Stop("选择后 Pt 未恰好增加 1，停止；请检查已选材料（尚未提交消耗）。")
+            chosen.add((x, y))
+        print(f"已自动选好 {current} 点基础材料，满足本次解锁；尚未提交消耗。", flush=True)
+        return current
 
     def wait_detail(self):
         deadline = time.monotonic()+20
