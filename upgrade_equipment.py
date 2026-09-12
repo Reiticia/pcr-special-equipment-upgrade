@@ -67,12 +67,19 @@ class Stop(RuntimeError):
     pass
 
 
+class UnlockProgressUnreadable(Stop):
+    """解锁 Pt 无法可靠识别，取消选材并跳过，禁止提交。"""
+
+
 class MaterialsUnavailable(Stop):
     """已确认升序且当前页无更多安全材料，可取消选材后跳过，不再滚动。"""
     def __init__(self, selected, needed):
         self.selected, self.needed = selected, needed
-        super().__init__(f"材料列表已确认升序，当前页无更多可用的 1 点数材料，"
-                         f"仅找到 {selected}/{needed} 点安全材料，无需向下滚动")
+        if selected > needed:
+            super().__init__(f"获得上限解锁 Pt {selected}/{needed}，超出需求，此装备跳过")
+        else:
+            super().__init__(f"材料列表已确认升序，当前页无更多可用的 1 点数材料，"
+                             f"仅找到 {selected}/{needed} 点安全材料，无需向下滚动")
 
 
 @dataclass(frozen=True)
@@ -106,7 +113,13 @@ def has_pink_diamond_outline(region: np.ndarray) -> bool:
     distance = np.abs(dx)/7 + np.abs(dy)/9
     ring = (distance >= .70) & (distance <= 1.30)
     interior = distance < .45
-    if np.mean(pink[ring]) < .25 or np.mean(pink[interior]) > .20:
+    ring_coverage = float(np.mean(pink[ring]))
+    interior_coverage = float(np.mean(pink[interior]))
+    # 莲花宣誓之服的透明中心会透出紫粉纹理。中心仍须以非粉色为主，
+    # 且此时要求更完整、相对中心更密集的粉边，不能只放宽颜色阈值。
+    patterned_center = (interior_coverage <= .45 and ring_coverage >= .40
+                        and ring_coverage-interior_coverage >= .10)
+    if ring_coverage < .25 or (interior_coverage > .20 and not patterned_center):
         return False
     return all(np.count_nonzero(pink & ring & (sx*dx > 0) & (sy*dy > 0)) >= 3
                for sx in (-1, 1) for sy in (-1, 1))
@@ -212,8 +225,8 @@ def unlock_progress(words):
         match = re.fullmatch(r"(\d+)/(\d+)[.。]?", text)
         if score >= .85 and 1130 <= x <= 1330 and 285 <= y <= 365 and match:
             values.append(tuple(map(int, match.groups())))
-    if len(values) != 1 or not 0 <= values[0][0] <= values[0][1] <= 20 or values[0][1] == 0:
-        raise Stop("无法唯一识别上限解锁 Pt 的当前值/需求值；不选择材料。")
+    if len(values) != 1 or not (0 <= values[0][0] <= 40 and 1 <= values[0][1] <= 20) or values[0][1] == 0:
+        raise UnlockProgressUnreadable("无法唯一识别上限解锁 Pt 的当前值/需求值；取消选材并跳过。")
     return values[0]
 
 
@@ -550,7 +563,7 @@ class Assistant:
         raise Stop("点击排序后未确认变为升序，不重复点击，也不继续选材。")
 
     def select_materials(self):
-        """仅在已确认升序的当前页选材，不滚动；每次核对 +1 Pt，满额即停。"""
+        """两点需求试选前两件并按实际 Pt 判断；其他需求沿用基础材料识别。"""
         image, words = self.snapshot("materials-start")
         self.require(words, "特别装备上限解锁", (250, 15, 1150, 115))
         current, needed = unlock_progress(words)
@@ -559,6 +572,27 @@ class Assistant:
         image, words = self.ensure_materials_ascending(image, words)
         if unlock_progress(words) != (current, needed):
             raise Stop("排序后材料 Pt 或需求发生变化，停止，不继续选材。")
+        if needed == 2:
+            # 固定布局第一行前两个材料槽；不再依赖容易误判的菱形/点数标签。
+            for x, y in ((143, 274), (298, 274)):
+                self.require(words, "特别装备上限解锁", (250, 15, 1150, 115))
+                if material_sort_direction(words) != "升序":
+                    raise Stop("选材时未能确认保持升序，不继续点击。")
+                before = current
+                self.win.click(x, y)
+                image, words = self.snapshot("material-selected")
+                self.require(words, "特别装备上限解锁", (250, 15, 1150, 115))
+                current, denominator = unlock_progress(words)
+                if denominator != needed or current < before:
+                    raise Stop("选择后 Pt 需求变化或点数减少，停止；尚未提交消耗。")
+                if current > needed:
+                    raise MaterialsUnavailable(current, needed)
+                if current == before:
+                    raise MaterialsUnavailable(current, needed)
+            if current != needed:
+                raise MaterialsUnavailable(current, needed)
+            print("前两件材料已选好，获得上限解锁 Pt 2/2，可以解锁；尚未提交消耗。", flush=True)
+            return current
         chosen = set()
         while current < needed:
             self.require(words, "特别装备上限解锁", (250, 15, 1150, 115))
@@ -631,12 +665,12 @@ class Assistant:
             if self.args.auto_materials:
                 try:
                     count = self.select_materials()
-                except MaterialsUnavailable as exc:
+                    if self.args.fully_auto:
+                        self.confirm_unlock()
+                except (MaterialsUnavailable, UnlockProgressUnreadable) as exc:
                     self.skip_material_shortage(original, stars, exc)
                     return
-                if self.args.fully_auto:
-                    self.confirm_unlock()
-                else:
+                if not self.args.fully_auto:
                     self.resume(
                         f"【材料已自动选择】已选 {count} 点基础未强化同名装备。\n"
                         "请核对已选材料，然后在游戏中点击解锁上限并完成确认。\n"

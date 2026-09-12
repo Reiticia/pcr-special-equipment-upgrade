@@ -14,7 +14,7 @@ from PIL import Image
 from upgrade_equipment import (
     BASE, STAR_CENTERS, Assistant, Stop, classify_stars,
     scrollbar_bottom, visible_candidates, material_candidates, unlock_progress, validate_pt_confirmation,
-    has_pink_diamond_outline, MaterialsUnavailable, Stars, artwork,
+    has_pink_diamond_outline, MaterialsUnavailable, UnlockProgressUnreadable, Stars, artwork,
     has_solid_gray_fill, mirror_log, main, material_sort_direction,
 )
 
@@ -50,8 +50,8 @@ class RecognitionTests(unittest.TestCase):
             bot.select_materials()
         self.assertEqual((caught.exception.selected, caught.exception.needed), (0, 2))
         bot.win.scroll_down.assert_not_called()
-        bot.win.click.assert_not_called()
-        bot.snapshot.assert_called_once_with('materials-start')
+        bot.win.click.assert_called_once_with(143, 274)
+        self.assertEqual(bot.snapshot.call_count, 2)
 
     def test_shortage_cancels_and_never_submits(self):
         bot = self.shortage_bot()
@@ -73,6 +73,29 @@ class RecognitionTests(unittest.TestCase):
         self.assertFalse(bot.known_material_shortage(image, Stars(('empty',)*4+('locked',))))
         bot.current_name = '另一种耳饰'
         self.assertFalse(bot.known_material_shortage(image, stars))
+
+    def test_unreadable_progress_cancels_and_skips(self):
+        for stage in ('selection', 'submission'):
+            with self.subTest(stage=stage):
+                bot = self.shortage_bot()
+                image = frame('detail-sage-empty.png')
+                stars = classify_stars(image)
+                bot.detail = MagicMock(return_value=(image, stars))
+                bot.open = MagicMock()
+                bot.snapshot = MagicMock(return_value=(image, []))
+                bot.wait_detail = MagicMock(return_value=(image, stars))
+                bot.auto_strengthen = MagicMock()
+                if stage == 'submission':
+                    bot.select_materials = MagicMock(return_value=2)
+                # 真实选材/提交方法读取空 OCR，必须走取消分支而非提交。
+                bot.process()
+                bot.win.click.assert_called_once_with(545, 708)
+                bot.auto_strengthen.assert_not_called()
+                self.assertTrue(bot.known_material_shortage(image, stars))
+
+    def test_unreadable_progress_has_specific_exception(self):
+        with self.assertRaises(UnlockProgressUnreadable):
+            unlock_progress([])
 
     def test_material_recognition_failure_still_stops(self):
         bot = self.shortage_bot()
@@ -146,6 +169,27 @@ class RecognitionTests(unittest.TestCase):
         words = json.loads((FIXTURES / 'materials-ocr.json').read_text(encoding='utf-8'))
         with self.assertRaises(Stop):
             unlock_progress(words+words)
+
+    def test_lotus_patterned_transparent_star_regression(self):
+        image = frame('detail-lotus-empty.png')
+        np.testing.assert_array_equal(np.median(image[294:299, 977:980], axis=(0, 1)),
+                                      [205, 172, 190])
+        self.assertEqual(classify_stars(image).slots,
+                         ('empty', 'empty', 'empty', 'locked', 'locked'))
+
+    def test_lotus_grid_candidate_recognized(self):
+        candidates = visible_candidates(frame('grid-lotus.png', 50, 155))
+        self.assertIn((301, 454), [(x, y) for x, y, _ in candidates])
+
+    def test_lotus_broken_outline_still_rejected(self):
+        region = frame('detail-lotus-empty.png')[287:306, 971:986].astype(float)
+        self.assertTrue(has_pink_diamond_outline(region))
+        region[:9, :7] = (205, 172, 190)
+        self.assertFalse(has_pink_diamond_outline(region))
+
+    def test_solid_pink_not_mistaken_for_outline(self):
+        region = np.full((19, 15, 3), (240, 140, 220), dtype=float)
+        self.assertFalse(has_pink_diamond_outline(region))
 
     def test_sage_earring_transparent_locked_star_regression(self):
         image = frame('detail-sage-empty.png')
@@ -342,8 +386,7 @@ class MaterialSortTests(unittest.TestCase):
                 bot.select_materials()
         self.assertEqual((caught.exception.selected, caught.exception.needed), (0, 2))
         self.assertIn('无需向下滚动', str(caught.exception))
-        bot.snapshot.assert_called_once_with('materials-start')
-        bot.win.click.assert_not_called()
+        bot.win.click.assert_called_once_with(143, 274)
         bot.win.scroll_down.assert_not_called()
 
     def test_partial_selection_then_no_more_materials_skips_without_scrolling(self):
@@ -351,13 +394,14 @@ class MaterialSortTests(unittest.TestCase):
         bot.snapshot.side_effect = [
             (object(), self.words('升序', '0/2')),
             (object(), self.words('升序', '1/2')),
+            (object(), self.words('升序', '1/2')),
         ]
-        # 即使图像检测重复返回刚选过的坐标，也不能再点一次或向下滚动。
+        # 第二槽没有可选材料时取消，不滚动。
         with patch('upgrade_equipment.material_candidates', return_value=[(143, 274)]):
             with self.assertRaises(MaterialsUnavailable) as caught:
                 bot.select_materials()
         self.assertEqual((caught.exception.selected, caught.exception.needed), (1, 2))
-        bot.win.click.assert_called_once_with(143, 274)
+        self.assertEqual(bot.win.click.call_args_list, [call(143, 274), call(298, 274)])
         bot.win.scroll_down.assert_not_called()
 
     def test_sort_changes_after_selection_is_not_treated_as_shortage(self):
@@ -372,6 +416,33 @@ class MaterialSortTests(unittest.TestCase):
         self.assertNotIsInstance(caught.exception, MaterialsUnavailable)
         bot.win.click.assert_called_once_with(143, 274)
         bot.win.scroll_down.assert_not_called()
+
+    def test_first_two_materials_decided_by_actual_progress(self):
+        for final in (2, 3, 4):
+            with self.subTest(final=final):
+                bot = self.bot()
+                bot.snapshot.side_effect = [
+                    (object(), self.words('升序', '0/2')),
+                    (object(), self.words('升序', '1/2')),
+                    (object(), self.words('升序', f'{final}/2')),
+                ]
+                with patch('upgrade_equipment.material_candidates', side_effect=AssertionError('不应依赖菱形识别')):
+                    if final == 2:
+                        self.assertEqual(bot.select_materials(), 2)
+                    else:
+                        with self.assertRaises(MaterialsUnavailable) as caught:
+                            bot.select_materials()
+                        self.assertEqual(caught.exception.selected, final)
+                self.assertEqual(bot.win.click.call_args_list, [call(143, 274), call(298, 274)])
+                bot.win.scroll_down.assert_not_called()
+
+    def test_overflow_never_submitted(self):
+        for progress in ('3/2', '4/2'):
+            bot = self.bot()
+            bot.snapshot.return_value = (object(), self.words('升序', progress))
+            with self.assertRaises(Stop):
+                bot.confirm_unlock()
+            bot.win.click.assert_not_called()
 
     def test_existing_selection_stops_before_sort(self):
         bot = self.bot()
